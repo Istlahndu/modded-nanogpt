@@ -28,7 +28,7 @@ import torch.nn.functional as F
 # torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 import triton
 import triton.language as tl
-from kernels import get_kernel
+# from kernels import get_kernel
 from torch import Tensor, nn
 
 dynamo.config.recompile_limit = 64
@@ -920,7 +920,8 @@ class AttnArgs:
     attn_scale: float
     key_offset: bool
 
-flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
+from flash_attn import flash_attn_varlen_func
+# flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
@@ -976,9 +977,24 @@ class CausalSelfAttention(nn.Module):
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
         # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                        max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                        causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
+        # y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+        #                                                 max_seqlen_q=max_len, max_seqlen_k=max_len,
+        #                                                 causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
+        
+        w_size = (bm_size, 0) if bm_size is not None else (-1, -1)
+        
+        y = flash_attn_varlen_func(
+            q[0], k[0], v[0],
+            cu_seqlens_q=seqlens,
+            cu_seqlens_k=seqlens,
+            max_seqlen_q=max_len,
+            max_seqlen_k=max_len,
+            dropout_p=0.0,
+            softmax_scale=attn_scale,
+            causal=True,
+            window_size=w_size
+        )
+
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
@@ -1623,7 +1639,7 @@ args.val_files = os.path.join(data_path, args.val_files)
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
 assert 8 % world_size == 0, "world_size must be a divisor of 8"
-grad_accum_steps = 8 // world_size
+grad_accum_steps = 16 // world_size
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
